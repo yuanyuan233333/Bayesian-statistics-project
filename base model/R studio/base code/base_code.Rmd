@@ -1,0 +1,405 @@
+
+```{r}
+install.packages(c("rjags", "coda", "R2jags", "ggplot2", "bayesplot", "loo", "rBayesianOptimization","tidyr"))
+```
+
+```{r}
+# Global model parameters
+M <- 3  # number of experts
+P <- 3  # number of features
+Q <- 3  # number of embeddings
+
+# Load required libraries
+library(rjags)
+library(coda)
+library(R2jags)
+library(ggplot2)
+library(bayesplot)
+library(loo)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+
+load.module("mix")
+set.factory("mix::TemperedMix", type = "sampler", state = FALSE)
+
+# Data preparation function
+prepare_data <- function(train_data, test_data) {
+  ##### Extract features and response variables
+  
+  # Train
+  x <- as.matrix(cbind(1, train_data[, (P+2):(P+Q)]))
+  phi_x <- as.matrix(cbind(1, train_data[, 2:P+1]))
+  y <- train_data$y.accel
+  
+  # Test
+  new_x <- as.matrix(cbind(1, test_data[, (P+2):(P+Q)]))
+  new_phi_x <- as.matrix(cbind(1, test_data[, 2:P+1]))
+  
+  ##### Define Hyperparameters
+  
+  alphas_coef_means <- matrix(
+    c(15.0, -50.0, 0.0,
+      -30.0, 50.0, 0.0,
+      0.0, 0.0, 0.0),
+    nrow = 3, ncol = 3, byrow = TRUE
+  )
+  
+  alphas_coef_sigmas <- matrix(
+    c(1.0, 0.1, 0.01,
+      1.0, 0.1, 0.01,
+      1.0, 1.0, 1.0),
+    nrow = 3, ncol = 3, byrow = TRUE
+  )
+  
+  theta_means <- matrix(
+    c(0.0, 0.0, 0.0,
+      0.0, 0.0, 0.0,
+      0.0, 0.0, 0.0),
+    nrow = 3, ncol = 3, byrow = TRUE
+  )
+  
+  theta_sigmas <- matrix(
+    c(1.0, 0.01, 0.01,
+      1.0, 0.01, 0.01,
+      0.5, 2.0, 2.0),
+    nrow = 3, ncol = 3, byrow = TRUE
+  )
+  
+  betas_coef_means <- c(-1.6137318461999999, -1.2966869064000006, -0.9773183402999996)
+  betas_coef_sigmas <- c(0.5300025697274576, 0.10300716052089773, 0.11656114525858899)
+  sigmas_log_means <- c(-5.0, -3.0, -1.0)
+  sigmas_log_sigmas <- c(0.2, 0.2, 0.2)
+  
+  ##### Create JAGS data list
+  return(list(
+    N = nrow(train_data),
+    N_new = nrow(test_data),
+    M = M,
+    P = P,
+    Q = Q,
+    x = x,
+    phi_x = phi_x,
+    y = y,
+    new_x = new_x,
+    new_phi_x = new_phi_x,
+    theta_means = theta_means,
+    theta_sigmas = theta_sigmas,
+    sigmas_log_means = sigmas_log_means,
+    sigmas_log_sigmas = sigmas_log_sigmas,
+    alphas_coef_means = alphas_coef_means,
+    alphas_coef_sigmas = alphas_coef_sigmas,
+    betas_coef_means = betas_coef_means,
+    betas_coef_sigmas = betas_coef_sigmas
+  ))
+}
+
+# Parameters to monitor (ensure that both gating probabilities are monitored)
+params <- c("thetas", "sigmas", "betas_coef", "alphas_coef", "y_new", "log_lik", "gate_out", "gate_out_new")
+
+# Run JAGS model
+run_model <- function(data, n.chains = 4, n.iter = 8000, n.burnin = 4000) {
+  jags_fit <- jags(
+    data = data,
+    parameters.to.save = params,
+    model.file = 'cocoafuse_predictive.bug',  # Make sure your BUGS model monitors gate_out and new_gate_out
+    n.chains = n.chains,
+    n.iter = n.iter,
+    n.burnin = n.burnin
+  )
+  return(jags_fit)
+}
+
+plot_gating_probabilities <- function(fit, train_data, test_data, M,
+                                      train_time_var = "x.times", test_time_var = "x.times",
+                                      lower_prob = 0.05, upper_prob = 0.95) {
+  sims_df <- as.data.frame(fit$BUGSoutput$sims.matrix)
+  
+  # for training
+  N_train <- nrow(train_data)
+  train_summary <- data.frame()
+  
+  for (n in 1:N_train) {
+    gate_sums <- rep(0, nrow(sims_df))
+    for (j in 1:M) {
+      param_name <- paste0("gate_out[", n, ",", j, "]")
+      gate_sums <- gate_sums + sims_df[[param_name]]
+    }
+    for (j in 1:M) {
+      param_name <- paste0("gate_out[", n, ",", j, "]")
+      values <- sims_df[[param_name]] / gate_sums
+      mean_val <- mean(values)
+      lower_val <- quantile(values, lower_prob)
+      upper_val <- quantile(values, upper_prob)
+      
+      train_summary <- rbind(train_summary, data.frame(
+        n = n,
+        expert = j,
+        mean_gate = mean_val,
+        lower = lower_val,
+        upper = upper_val,
+        time = train_data[[train_time_var]][n]
+      ))
+    }
+  }
+  
+  train_plot <- ggplot(train_summary, aes(x = time, y = mean_gate, color = factor(expert))) +
+    geom_line(linewidth = 1) +
+    geom_ribbon(aes(ymin = lower, ymax = upper, fill = factor(expert)), alpha = 0.2, color = NA) +
+    labs(
+      title = "Gating Probabilities Over Time for Each Expert (Train Data)",
+      x = "Time",
+      y = "Gating Probability",
+      color = "Expert",
+      fill = "Expert"
+    ) +
+    theme_minimal()
+  
+  # for testing
+  N_test <- nrow(test_data)
+  test_summary <- data.frame()
+  
+  for (n in 1:N_test) {
+    gate_sums <- rep(0, nrow(sims_df))
+    for (j in 1:M) {
+      param_name <- paste0("gate_out_new[", n, ",", j, "]")
+      if (!(param_name %in% names(sims_df))) {
+        param_name_alt <- paste0("gate_out_new.", n, ".", j)
+        if (param_name_alt %in% names(sims_df)) {
+          param_name <- param_name_alt
+        } else {
+          next
+        }
+      }
+      gate_sums <- gate_sums + sims_df[[param_name]]
+    }
+    for (j in 1:M) {
+      param_name <- paste0("gate_out_new[", n, ",", j, "]")
+      if (!(param_name %in% names(sims_df))) {
+        param_name_alt <- paste0("gate_out_new.", n, ".", j)
+        if (param_name_alt %in% names(sims_df)) {
+          param_name <- param_name_alt
+        } else {
+          next
+        }
+      }
+      values <- sims_df[[param_name]] / gate_sums
+      mean_val <- mean(values)
+      lower_val <- quantile(values, lower_prob)
+      upper_val <- quantile(values, upper_prob)
+      
+      test_summary <- rbind(test_summary, data.frame(
+        n = n,
+        expert = j,
+        mean_gate = mean_val,
+        lower = lower_val,
+        upper = upper_val,
+        time = test_data[[test_time_var]][n]
+      ))
+    }
+  }
+  
+
+  test_plot <- ggplot(test_summary, aes(x = time, y = mean_gate, color = factor(expert))) +
+    geom_line(linewidth = 1) +
+    geom_ribbon(aes(ymin = lower, ymax = upper, fill = factor(expert)), alpha = 0.2, color = NA) +
+    labs(
+      title = "Gating Probabilities Over Time for Each Expert (Test Data)",
+      x = "Time",
+      y = "Gating Probability",
+      color = "Expert",
+      fill = "Expert"
+    ) +
+    theme_minimal()
+  
+  print(train_plot)
+  print(test_plot)
+}
+
+
+plot_parameter_diagnostics <- function(fit) {
+  # Extract MCMC samples
+  samples <- as.mcmc(fit$BUGSoutput$sims.matrix)
+  
+  # Set up 1x2 plotting layout
+  par(mfrow = c(1, 2))
+  
+  # Plot parameters
+  # Thetas
+  for (i in 1:M) {
+    for (j in 1:P) {
+      param <- paste0("thetas[", i, ",", j, "]")
+      # Trace plot (left panel)
+      traceplot(samples[, param],
+                main = paste("Trace:", param),
+                ylab = "Value",
+                xlab = "Iteration")
+      # Histogram (right panel)
+      hist(samples[, param],
+           main = paste("Histogram:", param),
+           xlab = "Value",
+           breaks = 30,
+           prob = TRUE)
+      lines(density(samples[, param]), col = "red")
+      abline(v = mean(samples[, param]), col = "blue", lwd = 2)
+      quantiles <- quantile(samples[, param], c(0.025, 0.975))
+      abline(v = quantiles, col = "blue", lty = 2)
+      variance <- var(samples[, param])
+      mtext(paste("Variance:", round(variance, 2)), size = 3, line = 0.5, adj = 1, col = "blue")
+    }
+  }
+  
+  # Sigmas
+  for (i in 1:M) {
+    param <- paste0("sigmas[", i, "]")
+    traceplot(samples[, param],
+              main = paste("Trace:", param),
+              ylab = "Value",
+              xlab = "Iteration")
+    
+    hist(samples[, param],
+         main = paste("Histogram:", param),
+         xlab = "Value",
+         breaks = 30,
+         prob = TRUE)
+    lines(density(samples[, param]), col = "red")
+    abline(v = mean(samples[, param]), col = "blue", lwd = 2)
+    quantiles <- quantile(samples[, param], c(0.025, 0.975))
+    abline(v = quantiles, col = "blue", lty = 2)
+    variance <- var(samples[, param])
+    mtext(paste("Variance:", round(variance, 2)), size = 3, line = 0.5, adj = 1, col = "blue")
+  }
+  
+  # Betas
+  for (i in 1:Q) {
+    param <- paste0("betas_coef[", i, "]")
+    traceplot(samples[, param],
+              main = paste("Trace:", param),
+              ylab = "Value",
+              xlab = "Iteration")
+    
+    hist(samples[, param],
+         main = paste("Histogram:", param),
+         xlab = "Value",
+         breaks = 30,
+         prob = TRUE)
+    lines(density(samples[, param]), col = "red")
+    abline(v = mean(samples[, param]), col = "blue", lwd = 2)
+    quantiles <- quantile(samples[, param], c(0.025, 0.975))
+    abline(v = quantiles, col = "blue", lty = 2)
+    variance <- var(samples[, param])
+    mtext(paste("Variance:", round(variance, 2)), side = 3, line = 0.5, adj = 1, col = "blue")
+  }
+  
+  # Alphas
+  for (i in 1:M) {
+    for (j in 1:Q) {
+      param <- paste0("alphas_coef[", i, ",", j, "]")
+      traceplot(samples[, param],
+                main = paste("Trace:", param),
+                ylab = "Value",
+                xlab = "Iteration")
+      
+      hist(samples[, param],
+           main = paste("Histogram:", param),
+           xlab = "Value",
+           breaks = 30,
+           prob = TRUE)
+      lines(density(samples[, param]), col = "red")
+      abline(v = mean(samples[, param]), col = "blue", lwd = 2)
+      quantiles <- quantile(samples[, param], c(0.025, 0.975))
+      abline(v = quantiles, col = "blue", lty = 2)
+      variance <- var(samples[, param])
+      mtext(paste("Variance:", round(variance, 2)), size = 3, line = 0.5, adj = 1, col = "blue")
+    }
+  }
+}
+
+
+calculate_metrics <- function(y_true, y_pred) {
+  mae <- mean(abs(y_true - y_pred))
+  mse <- mean((y_true - y_pred)^2)
+  rmse <- sqrt(mse)
+  ss_res <- sum((y_true - y_pred)^2)
+  ss_tot <- sum((y_true - mean(y_true))^2)
+  r_squared <- 1 - (ss_res / ss_tot)
+  return(list(MAE = mae, RMSE = rmse, R2 = r_squared))
+}
+
+# Plot predictions
+plot_predictions <- function(fit) {  
+  # Extract predictions
+  y_pred_samples <- fit$BUGSoutput$sims.list$y_new
+  
+  # Compute metrics using test data's response variable
+  samples <- as.mcmc(fit$BUGSoutput$sims.matrix)
+  samples_df <- as.data.frame(samples)
+  log_lik_cols <- grep("log_lik", colnames(samples_df))
+  log_lik <- as.matrix(samples_df[, log_lik_cols])
+  loo_result <- loo(log_lik)
+  # Extract Pareto k diagnostics
+  pareto_k <- loo_result$diagnostics$pareto_k
+  
+  metrics <- calculate_metrics(test_data$y.accel, y_pred_samples)
+  metrics_text <- sprintf("MAE: %.3f\nRMSE: %.3f\nR²: %.3f", 
+                          metrics$MAE, metrics$RMSE, metrics$R2)
+  
+  elpd_loo_val <- round(loo_result$estimates["elpd_loo", "Estimate"], 2)
+  final_label <- paste0(
+    sprintf("elpd_loo: %.2f\n", elpd_loo_val),
+    metrics_text
+  )
+  
+  # Create predictions dataframe
+  predictions <- data.frame(
+    times = test_data$x.times,
+    y_true = test_data$y.accel,
+    y_pred_mean = colMeans(y_pred_samples),
+    y_pred_lower = apply(y_pred_samples, 2, quantile, probs = 0.05),
+    y_pred_upper = apply(y_pred_samples, 2, quantile, probs = 0.95)
+  )
+  
+  # Create plot
+  p <- ggplot() +
+    geom_ribbon(data = predictions,
+                aes(x = times, ymin = y_pred_lower, ymax = y_pred_upper),
+                fill = "turquoise", alpha = 0.3) +
+    geom_line(data = predictions,
+              aes(x = times, y = y_pred_mean),
+              color = "black", size = 1) +
+    geom_point(data = train_data,
+               aes(x = x.times, y = y.accel, shape = "Train"),
+               color = "black", alpha = 0.6) +
+    geom_point(data = test_data,
+               aes(x = x.times, y = y.accel, shape = "Test"),
+               color = "black", alpha = 0.6) +
+    scale_shape_manual(values = c(Train = 4, Test = 1)) +
+    labs(x = "Time", y = "Acceleration") +
+    ylim(-1.5, 1.1) +
+    theme_minimal() +
+    annotate("text", x = Inf, y = Inf, label = final_label,
+             hjust = 1.1, vjust = 1.1, size = 5, color = "blue")
+  print(p)
+}
+
+
+# Main execution
+# Read data files
+train_data <- read.csv("train_data.csv")
+test_data <- read.csv("test_data.csv")
+data <- prepare_data(train_data, test_data)
+fit <- run_model(data)
+
+# Output all plots to a PDF
+pdf("results.pdf", width = 15, height = 8)
+
+# Plot predictions
+plot_predictions(fit)
+# Plot gating probabilities
+plot_gating_probabilities(fit, train_data, test_data, M = M, train_time_var = "x.times", test_time_var = "x.times")
+# Plot parameter diagnostics
+plot_parameter_diagnostics(fit)
+dev.off()
+
+```

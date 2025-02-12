@@ -1,0 +1,80 @@
+var alphas_coef[M, Q]
+
+model {
+    # priors - gates
+    for (i in 1:Q) {
+        betas_coef[i] ~ ddexp(betas_coef_means[i], 1 / betas_coef_sigmas[i])
+    }
+    for (i in 1:(M-1)) {
+        for (j in 1:Q) {
+            alphas_coef[i, j] ~ ddexp(alphas_coef_means[i, j], 1 / alphas_coef_sigmas[i, j])
+        }
+    }
+    alphas_coef[M, ] <- rep(0.0, Q)
+
+    # priors - experts
+    for (i in 1:M) {
+        sigmas[i] ~ dlnorm(sigmas_log_means[i], 1.0 / sigmas_log_sigmas[i]^2)
+        for (j in 1:P) {
+            thetas[i, j] ~ dnorm(theta_means[i, j], 1.0 / theta_sigmas[i, j]^2)
+        }
+    }
+
+    comp_mus <- x %*% t(thetas)
+    alpha_scores <- phi_x %*% t(alphas_coef)
+    betas_scores <- phi_x %*% betas_coef
+
+    # actual model
+    for (n in 1:N) {
+        # computing the outputs of the gates
+        comp_prob[n] <- ilogit(betas_scores[n])
+        for (j in 1:M) {
+            exp_alpha_scores[n, j] <- ifelse(j < M, exp(alpha_scores[n, j]), 1.0)
+        }
+        for (j in 1:M) {
+            comp_gate_out[n, j] <- (exp_alpha_scores[n, j] / sum(exp_alpha_scores[n, ]))
+        }
+        gate_out[n, 1:(M+1)] <- c(comp_prob[n] * comp_gate_out[n, 1:M], 1.0 - comp_prob[n])
+
+        # computing the collaborative/competitive means
+        coll_mean[n] <- inprod(comp_gate_out[n, 1:M], comp_mus[n, ])
+        coll_sigm[n] <- sqrt(inprod(comp_gate_out[n, 1:M], sigmas^2))
+
+        full_means[n, 1:(M+1)] <- c(comp_mus[n, ], coll_mean[n])
+        full_sigms[n, 1:(M+1)] <- c(sigmas, coll_sigm[n])
+
+        # distribution of the response
+        y[n] ~ dnormmix(full_means[n, 1:(M+1)], 1.0 / full_sigms[n, 1:(M+1)]^2, gate_out[n, 1:(M+1)])
+        log_lik[n] <- logdensity.normmix(y[n], full_means[n, 1:(M+1)], 1.0 / full_sigms[n, 1:(M+1)]^2, gate_out[n, 1:(M+1)])
+    }
+
+
+    # Prediction for new data
+    for (n in 1:N_new) {
+        # Compute expert means for new data
+        comp_mus_new[n, 1:M] <- new_x[n, ] %*% t(thetas)
+        alpha_scores_new[n, 1:M] <- new_phi_x[n, ] %*% t(alphas_coef)
+        betas_scores_new[n] <- new_phi_x[n, ] %*% betas_coef
+
+        # Compute gate outputs for new data
+        comp_prob_new[n] <- ilogit(betas_scores_new[n])
+        for (j in 1:M) {
+            exp_alpha_scores_new[n, j] <- ifelse(j < M, exp(alpha_scores_new[n, j]), 1.0)
+        }
+        for (j in 1:M) {
+            comp_gate_out_new[n, j] <- (exp_alpha_scores_new[n, j] / sum(exp_alpha_scores_new[n, ]))
+        }
+        gate_out_new[n, 1:(M+1)] <- c(comp_prob_new[n] * comp_gate_out_new[n, 1:M], 1.0 - comp_prob_new[n])
+
+        # Compute collaborative/competitive means for new data
+        coll_mean_new[n] <- inprod(comp_gate_out_new[n, 1:M], comp_mus_new[n, ])
+        coll_sigm_new[n] <- sqrt(inprod(comp_gate_out_new[n, 1:M], sigmas^2))
+
+        # Combine means and variances for new data
+        full_means_new[n, 1:(M+1)] <- c(comp_mus_new[n, ], coll_mean_new[n])
+        full_sigms_new[n, 1:(M+1)] <- c(sigmas, coll_sigm_new[n])
+
+        # Predictive distribution for new data
+        y_new[n] ~ dnormmix(full_means_new[n, 1:(M+1)], 1.0 / full_sigms_new[n, 1:(M+1)]^2, gate_out_new[n, 1:(M+1)])
+    }
+}
